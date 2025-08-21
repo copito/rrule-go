@@ -908,6 +908,237 @@ func (r *RRule) All() []time.Time {
 	return all(r.Iterator())
 }
 
+// rruleReverseIterator is a reverse iterator of RRule
+type rruleReverseIterator struct {
+	year     int
+	month    time.Month
+	day      int
+	hour     int
+	minute   int
+	second   int
+	weekday  int
+	ii       iterInfo
+	timeset  []time.Time
+	total    int
+	count    int
+	remain   reusingRemainSlice
+	finished bool
+	dayset   []optInt
+}
+
+func (iterator *rruleReverseIterator) generate() {
+	if iterator.finished {
+		return
+	}
+
+	r := iterator.ii.rrule
+	i := 0
+	for iterator.remain.Len() == 0 {
+		if i > 100000 {
+			// Emergency exit for infinite loops.
+			iterator.finished = true
+			return
+		}
+		i++
+		// Get dayset with the right frequency
+		setStart, setEnd := iterator.ii.calcDaySet(r.freq, iterator.year, iterator.month, iterator.day)
+		iterator.fillDaySetBackwards(setStart, setEnd)
+		dayset := iterator.dayset
+		filtered := false
+
+		// Do the "hard" work ;-)
+		for dayIndex, day := range dayset {
+			i := day.Int
+			if len(r.bymonth) != 0 && !contains(r.bymonth, iterator.ii.mmask[i]) ||
+				len(r.byweekno) != 0 && iterator.ii.wnomask[i] == 0 ||
+				len(r.byweekday) != 0 && !contains(r.byweekday, iterator.ii.wdaymask[i]) ||
+				len(iterator.ii.nwdaymask) != 0 && iterator.ii.nwdaymask[i] == 0 ||
+				len(r.byeaster) != 0 && iterator.ii.eastermask[i] == 0 ||
+				(len(r.bymonthday) != 0 || len(r.bynmonthday) != 0) &&
+					!contains(r.bymonthday, iterator.ii.mdaymask[i]) &&
+					!contains(r.bynmonthday, iterator.ii.nmdaymask[i]) ||
+				len(r.byyearday) != 0 &&
+					(i < iterator.ii.yearlen &&
+						!contains(r.byyearday, i+1) &&
+						!contains(r.byyearday, -iterator.ii.yearlen+i) ||
+						i >= iterator.ii.yearlen &&
+							!contains(r.byyearday, i+1-iterator.ii.yearlen) &&
+							!contains(r.byyearday, -iterator.ii.nextyearlen+i-iterator.ii.yearlen)) {
+				dayset[dayIndex].Defined = false
+				filtered = true
+			}
+		}
+
+		// Output results
+		if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
+			var poslist []time.Time
+			for _, pos := range r.bysetpos {
+				var daypos, timepos int
+				if pos < 0 {
+					daypos, timepos = divmod(pos, len(iterator.timeset))
+				} else {
+					daypos, timepos = divmod(pos-1, len(iterator.timeset))
+				}
+				var temp []int
+				for _, day := range dayset {
+					if day.Defined {
+						temp = append(temp, day.Int)
+					}
+				}
+				i, err := pySubscript(temp, daypos)
+				if err != nil {
+					continue
+				}
+				timeTemp := iterator.timeset[timepos]
+				dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, i).Date()
+				tempHour, tempMinute, tempSecond := timeTemp.Clock()
+				res := time.Date(dateYear, dateMonth, dateDay,
+					tempHour, tempMinute, tempSecond,
+					timeTemp.Nanosecond(), timeTemp.Location())
+				if !timeContains(poslist, res) {
+					poslist = append(poslist, res)
+				}
+			}
+			sort.Sort(sort.Reverse(timeSlice(poslist)))
+			for _, res := range poslist {
+				if !r.until.IsZero() && res.Before(r.until) {
+					r.len = iterator.total
+					iterator.finished = true
+					return
+				} else if !res.After(r.dtstart) {
+					iterator.total++
+					iterator.remain.Append(res)
+					if iterator.count != 0 {
+						iterator.count--
+						if iterator.count == 0 {
+							r.len = iterator.total
+							iterator.finished = true
+							return
+						}
+					}
+				}
+			}
+		} else {
+			for _, day := range dayset {
+				if !day.Defined {
+					continue
+				}
+				i := day.Int
+				dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, i).Date()
+				for _, timeTemp := range iterator.timeset {
+					tempHour, tempMinute, tempSecond := timeTemp.Clock()
+					res := time.Date(dateYear, dateMonth, dateDay,
+						tempHour, tempMinute, tempSecond,
+						timeTemp.Nanosecond(), timeTemp.Location())
+					if !r.until.IsZero() && res.Before(r.until) {
+						r.len = iterator.total
+						iterator.finished = true
+						return
+					} else if !res.After(r.dtstart) {
+						iterator.total++
+						iterator.remain.Append(res)
+						if iterator.count != 0 {
+							iterator.count--
+							if iterator.count == 0 {
+								r.len = iterator.total
+								iterator.finished = true
+								return
+							}
+						}
+					}
+				}
+			}
+		}
+		// Handle frequency and interval
+		currentDate := time.Date(iterator.year, iterator.month, iterator.day, iterator.hour, iterator.minute, iterator.second, 0, r.dtstart.Location())
+		switch r.freq {
+		case YEARLY:
+			currentDate = currentDate.AddDate(-r.interval, 0, 0)
+		case MONTHLY:
+			currentDate = currentDate.AddDate(0, -r.interval, 0)
+		case WEEKLY:
+			currentDate = currentDate.AddDate(0, 0, -r.interval*7)
+		case DAILY:
+			currentDate = currentDate.AddDate(0, 0, -r.interval)
+		case HOURLY:
+			if filtered {
+				// Jump to one iteration before next day
+				currentDate = currentDate.Add(time.Duration(-((23-iterator.hour)/r.interval)*r.interval) * time.Hour)
+			}
+			currentDate = currentDate.Add(time.Duration(-r.interval) * time.Hour)
+		case MINUTELY:
+			if filtered {
+				// Jump to one iteration before next day
+				currentDate = currentDate.Add(time.Duration(-((1439-(iterator.hour*60+iterator.minute))/r.interval)*r.interval) * time.Minute)
+			}
+			currentDate = currentDate.Add(time.Duration(-r.interval) * time.Minute)
+		case SECONDLY:
+			if filtered {
+				// Jump to one iteration before next day
+				currentDate = currentDate.Add(time.Duration(-(((86399-(iterator.hour*3600+iterator.minute*60+iterator.second))/r.interval)*r.interval)) * time.Second)
+			}
+			currentDate = currentDate.Add(time.Duration(-r.interval) * time.Second)
+		}
+
+		iterator.year, iterator.month, iterator.day = currentDate.Date()
+		iterator.hour, iterator.minute, iterator.second = currentDate.Clock()
+		if iterator.year < 1 {
+			r.len = iterator.total
+			iterator.finished = true
+			return
+		}
+		iterator.ii.rebuild(iterator.year, iterator.month)
+	}
+}
+
+func (iterator *rruleReverseIterator) fillDaySetBackwards(start, end int) {
+	desiredLen := end - start
+
+	if cap(iterator.dayset) < desiredLen {
+		iterator.dayset = make([]optInt, 0, desiredLen)
+	} else {
+		iterator.dayset = iterator.dayset[:0]
+	}
+
+	for i := end - 1; i >= start; i-- {
+		iterator.dayset = append(iterator.dayset, optInt{
+			Int:     i,
+			Defined: true,
+		})
+	}
+}
+
+// next returns next occurrence and true if it exists, else zero value and false
+func (iterator *rruleReverseIterator) next() (time.Time, bool) {
+	iterator.generate()
+	return iterator.remain.Pop()
+}
+
+// ReverseIterator returns an iterator for RRule that iterates backwards.
+func (r *RRule) ReverseIterator() Next {
+	iterator := rruleReverseIterator{}
+	iterator.year, iterator.month, iterator.day = r.dtstart.Date()
+	iterator.hour, iterator.minute, iterator.second = r.dtstart.Clock()
+	iterator.weekday = toPyWeekday(r.dtstart.Weekday())
+
+	iterator.ii = iterInfo{rrule: r}
+	iterator.ii.rebuild(iterator.year, iterator.month)
+
+	if r.freq < HOURLY {
+		iterator.timeset = r.timeset
+	} else {
+		if r.freq >= HOURLY && len(r.byhour) != 0 && !contains(r.byhour, iterator.hour) ||
+			r.freq >= MINUTELY && len(r.byminute) != 0 && !contains(r.byminute, iterator.minute) ||
+			r.freq >= SECONDLY && len(r.bysecond) != 0 && !contains(r.bysecond, iterator.second) {
+			iterator.timeset = nil
+		} else {
+			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+		}
+	}
+	iterator.count = r.count
+	return iterator.next
+}
+
 // Between returns all the occurrences of the RRule between after and before.
 // The inc keyword defines what happens if after and/or before are themselves occurrences.
 // With inc == True, they will be included in the list, if they are found in the recurrence set.
